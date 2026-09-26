@@ -206,6 +206,11 @@ impl<'a, S> AsRef<Certificate> for CertifiedIssuer<'a, S> {
 ///
 /// Encapsulates the distinguished name, key identifier method, key usages and signing key
 /// of the issuing certificate.
+///
+/// `S` is usually a [`SigningKey`], but constructing an `Issuer` only requires [`PublicKeyData`].
+/// This allows building an `Issuer` from an issuer's public key alone, for use with the
+/// `tbs_*` methods (e.g. [`CertificateParams::tbs_certificate`]) when the actual signing
+/// happens out of process.
 pub struct Issuer<'a, S> {
 	distinguished_name: Cow<'a, DistinguishedName>,
 	key_identifier_method: Cow<'a, KeyIdMethod>,
@@ -213,7 +218,7 @@ pub struct Issuer<'a, S> {
 	signing_key: S,
 }
 
-impl<'a, S: SigningKey> Issuer<'a, S> {
+impl<'a, S: PublicKeyData> Issuer<'a, S> {
 	/// Create a new issuer from the given parameters and signing key.
 	pub fn new(params: CertificateParams, signing_key: S) -> Self {
 		Self {
