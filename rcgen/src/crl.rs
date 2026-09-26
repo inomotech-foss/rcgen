@@ -4,7 +4,7 @@ use pki_types::CertificateRevocationListDer;
 use time::OffsetDateTime;
 use yasna::{DERWriter, Tag};
 
-use crate::key_pair::sign_der;
+use crate::key_pair::{serialize_signed_der, serialize_tbs, PublicKeyData};
 #[cfg(feature = "pem")]
 use crate::ENCODE_CONFIG;
 use crate::{
@@ -70,6 +70,18 @@ pub struct CertificateRevocationList {
 }
 
 impl CertificateRevocationList {
+	/// Constructs a `CertificateRevocationList` from its DER encoding.
+	///
+	/// This is intended for a detached-signing workflow: obtain the `TBSCertList` DER from
+	/// [`CertificateRevocationListParams::tbs_cert_list`], sign it with a key that may live
+	/// outside of this process, and assemble the result with
+	/// [`serialize_signed_der`]. No validation is performed; the
+	/// caller is responsible for `der` encoding a well-formed, correctly signed CRL.
+	#[must_use]
+	pub fn from_der(der: CertificateRevocationListDer<'static>) -> Self {
+		Self { der }
+	}
+
 	/// Get the CRL in PEM encoded format.
 	#[cfg(feature = "pem")]
 	pub fn pem(&self) -> Result<String, Error> {
@@ -188,11 +200,30 @@ impl CertificateRevocationListParams {
 		&self,
 		issuer: &Issuer<'_, impl SigningKey>,
 	) -> Result<CertificateRevocationList, Error> {
+		let tbs = self.tbs_cert_list(issuer)?;
+		let sig = issuer.key().sign(&tbs)?;
+		Ok(CertificateRevocationList {
+			der: serialize_signed_der(&tbs, issuer.key().algorithm(), &sig).into(),
+		})
+	}
+
+	/// Returns the DER encoding of the CRL's `TBSCertList` (RFC 5280 §5.1), exactly as it would
+	/// be signed by [`Self::signed_by`].
+	///
+	/// This allows signing to happen out of process, for example with a key held by a remote
+	/// signing service: obtain the `TBSCertList` DER from this method, sign it, and assemble the
+	/// finished CRL with [`serialize_signed_der`] and
+	/// [`CertificateRevocationList::from_der`]. `issuer` only needs to provide its public key and
+	/// algorithm; it does not need to be able to sign (see [`Issuer`]'s `S: `[`PublicKeyData`]
+	/// bound).
+	pub fn tbs_cert_list(&self, issuer: &Issuer<'_, impl PublicKeyData>) -> Result<Vec<u8>, Error> {
 		if self.next_update.le(&self.this_update) {
 			return Err(Error::InvalidCrlNextUpdate);
 		}
 
-		if !issuer.key_usages.is_empty() && !issuer.key_usages.contains(&KeyUsagePurpose::CrlSign) {
+		if !issuer.key_usages().is_empty()
+			&& !issuer.key_usages().contains(&KeyUsagePurpose::CrlSign)
+		{
 			return Err(Error::IssuerNotCrlSigner);
 		}
 
@@ -207,13 +238,7 @@ impl CertificateRevocationListParams {
 			return Err(Error::EmptyCrlDistributionPointUris);
 		}
 
-		Ok(CertificateRevocationList {
-			der: self.serialize_der(issuer)?.into(),
-		})
-	}
-
-	fn serialize_der(&self, issuer: &Issuer<'_, impl SigningKey>) -> Result<Vec<u8>, Error> {
-		sign_der(&issuer.signing_key, |writer| {
+		serialize_tbs(|writer| {
 			// Write CRL version.
 			// RFC 5280 §5.1.2.1:
 			//   This optional field describes the version of the encoded CRL.  When
@@ -229,10 +254,7 @@ impl CertificateRevocationListParams {
 			// RFC 5280 §5.1.2.2:
 			//   This field MUST contain the same algorithm identifier as the
 			//   signatureAlgorithm field in the sequence CertificateList
-			issuer
-				.signing_key
-				.algorithm()
-				.write_alg_ident(writer.next());
+			issuer.key().algorithm().write_alg_ident(writer.next());
 
 			// Write issuer.
 			// RFC 5280 §5.1.2.3:
@@ -276,7 +298,7 @@ impl CertificateRevocationListParams {
 					write_x509_authority_key_identifier(
 						writer.next(),
 						self.key_identifier_method
-							.derive(issuer.signing_key.subject_public_key_info()),
+							.derive(issuer.key().subject_public_key_info()),
 					);
 
 					// Write CRL number.

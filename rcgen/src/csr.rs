@@ -210,6 +210,18 @@ impl CertificateSigningRequestParams {
 				.serialize_der_with_signer(&self.public_key, issuer)?,
 		})
 	}
+
+	/// Returns the DER encoding of the certificate's `TBSCertificate`, exactly as it would be
+	/// signed by [`Self::signed_by`].
+	///
+	/// See [`CertificateParams::tbs_certificate`] for details on using the result to sign the
+	/// certificate out of process.
+	pub fn tbs_certificate(
+		&self,
+		issuer: &Issuer<'_, impl PublicKeyData>,
+	) -> Result<Vec<u8>, Error> {
+		self.params.tbs_certificate(&self.public_key, issuer)
+	}
 }
 
 #[cfg(all(test, feature = "x509-parser"))]
