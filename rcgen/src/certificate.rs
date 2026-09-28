@@ -13,7 +13,9 @@ use crate::extension::{
 	AuthorityKeyIdentifier, CrlDistributionPoints, ExtendedKeyUsage, Extension, KeyUsage,
 	NameConstraintsExt, SubjectAlternativeName, SubjectKeyIdentifier,
 };
-use crate::key_pair::{serialize_public_key_der, sign_der, PublicKeyData};
+use crate::key_pair::{
+	serialize_public_key_der, serialize_signed_der, serialize_tbs, sign_der, PublicKeyData,
+};
 #[cfg(feature = "crypto")]
 use crate::ring_like::digest;
 #[cfg(feature = "pem")]
@@ -147,6 +149,94 @@ impl CertificateParams {
 	) -> Result<Certificate, Error> {
 		Ok(Certificate {
 			der: self.serialize_der_with_signer(public_key, issuer)?,
+		})
+	}
+
+	/// Returns the DER encoding of the certificate's `TBSCertificate` (RFC 5280 §4.1), exactly as
+	/// it would be signed by [`Self::signed_by`].
+	///
+	/// This allows signing to happen out of process, for example with a key held by a remote
+	/// signing service: obtain the `TBSCertificate` DER from this method, sign it, and assemble
+	/// the finished certificate with [`serialize_signed_der`]. `issuer` only needs to provide its
+	/// public key and algorithm; it does not need to be able to sign (see [`Issuer`]'s
+	/// `S: `[`PublicKeyData`] bound).
+	///
+	/// A self-signed certificate's `TBSCertificate` can be obtained the same way, by passing the
+	/// subject's own key as both `public_key` and (wrapped in an [`Issuer`]) as `issuer`.
+	pub fn tbs_certificate<K: PublicKeyData>(
+		&self,
+		public_key: &K,
+		issuer: &Issuer<'_, impl PublicKeyData>,
+	) -> Result<Vec<u8>, Error> {
+		// An empty distribution point would be encoded as an empty fullName,
+		// violating GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
+		// (RFC 5280 §4.2.1.13).
+		if self
+			.crl_distribution_points
+			.iter()
+			.any(|dp| dp.uris.is_empty())
+		{
+			return Err(Error::EmptyCrlDistributionPointUris);
+		}
+
+		serialize_tbs(|writer| {
+			let pub_key_spki = public_key.subject_public_key_info();
+			// Write version
+			writer.next().write_tagged(Tag::context(0), |writer| {
+				writer.write_u8(2);
+			});
+			// Write serialNumber
+			if let Some(ref serial) = self.serial_number {
+				writer.next().write_bigint_bytes(serial.as_ref(), true);
+			} else {
+				#[cfg(feature = "crypto")]
+				{
+					let hash = digest::digest(&digest::SHA256, public_key.der_bytes());
+					// RFC 5280 specifies at most 20 bytes for a serial number
+					let mut sl = hash.as_ref()[0..20].to_vec();
+					sl[0] &= 0x7f; // MSB must be 0 to ensure encoding bignum in 20 bytes
+					writer.next().write_bigint_bytes(&sl, true);
+				}
+				#[cfg(not(feature = "crypto"))]
+				if self.serial_number.is_none() {
+					return Err(Error::MissingSerialNumber);
+				}
+			};
+			// Write signature algorithm
+			issuer.key().algorithm().write_alg_ident(writer.next());
+			// Write issuer name
+			write_distinguished_name(writer.next(), issuer.distinguished_name.as_ref());
+			// Write validity
+			writer.next().write_sequence(|writer| {
+				// Not before
+				write_dt_utc_or_generalized(writer.next(), self.not_before);
+				// Not after
+				write_dt_utc_or_generalized(writer.next(), self.not_after);
+				Ok::<(), Error>(())
+			})?;
+			// Write subject
+			write_distinguished_name(writer.next(), &self.distinguished_name);
+			// Write subjectPublicKeyInfo
+			serialize_public_key_der(public_key, writer.next());
+			// write extensions
+			let should_write_exts = self.use_authority_key_identifier_extension
+				|| !self.subject_alt_names.is_empty()
+				|| !self.key_usages.is_empty()
+				|| !self.extended_key_usages.is_empty()
+				|| self.name_constraints.iter().any(|c| !c.is_empty())
+				|| !self.crl_distribution_points.is_empty()
+				|| matches!(self.is_ca, IsCa::ExplicitNoCa)
+				|| matches!(self.is_ca, IsCa::Ca(_))
+				|| !self.custom_extensions.is_empty();
+			if !should_write_exts {
+				return Ok(());
+			}
+
+			writer.next().write_tagged(Tag::context(3), |writer| {
+				writer.write_sequence(|writer| self.write_extensions(writer, &pub_key_spki, issuer))
+			})?;
+
+			Ok(())
 		})
 	}
 
@@ -358,88 +448,16 @@ impl CertificateParams {
 		pub_key: &K,
 		issuer: &Issuer<'_, impl SigningKey>,
 	) -> Result<CertificateDer<'static>, Error> {
-		// An empty distribution point would be encoded as an empty fullName,
-		// violating GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
-		// (RFC 5280 §4.2.1.13).
-		if self
-			.crl_distribution_points
-			.iter()
-			.any(|dp| dp.uris.is_empty())
-		{
-			return Err(Error::EmptyCrlDistributionPointUris);
-		}
-
-		let der = sign_der(&issuer.signing_key, |writer| {
-			let pub_key_spki = pub_key.subject_public_key_info();
-			// Write version
-			writer.next().write_tagged(Tag::context(0), |writer| {
-				writer.write_u8(2);
-			});
-			// Write serialNumber
-			if let Some(ref serial) = self.serial_number {
-				writer.next().write_bigint_bytes(serial.as_ref(), true);
-			} else {
-				#[cfg(feature = "crypto")]
-				{
-					let hash = digest::digest(&digest::SHA256, pub_key.der_bytes());
-					// RFC 5280 specifies at most 20 bytes for a serial number
-					let mut sl = hash.as_ref()[0..20].to_vec();
-					sl[0] &= 0x7f; // MSB must be 0 to ensure encoding bignum in 20 bytes
-					writer.next().write_bigint_bytes(&sl, true);
-				}
-				#[cfg(not(feature = "crypto"))]
-				if self.serial_number.is_none() {
-					return Err(Error::MissingSerialNumber);
-				}
-			};
-			// Write signature algorithm
-			issuer
-				.signing_key
-				.algorithm()
-				.write_alg_ident(writer.next());
-			// Write issuer name
-			write_distinguished_name(writer.next(), issuer.distinguished_name.as_ref());
-			// Write validity
-			writer.next().write_sequence(|writer| {
-				// Not before
-				write_dt_utc_or_generalized(writer.next(), self.not_before);
-				// Not after
-				write_dt_utc_or_generalized(writer.next(), self.not_after);
-				Ok::<(), Error>(())
-			})?;
-			// Write subject
-			write_distinguished_name(writer.next(), &self.distinguished_name);
-			// Write subjectPublicKeyInfo
-			serialize_public_key_der(pub_key, writer.next());
-			// write extensions
-			let should_write_exts = self.use_authority_key_identifier_extension
-				|| !self.subject_alt_names.is_empty()
-				|| !self.key_usages.is_empty()
-				|| !self.extended_key_usages.is_empty()
-				|| self.name_constraints.iter().any(|c| !c.is_empty())
-				|| !self.crl_distribution_points.is_empty()
-				|| matches!(self.is_ca, IsCa::ExplicitNoCa)
-				|| matches!(self.is_ca, IsCa::Ca(_))
-				|| !self.custom_extensions.is_empty();
-			if !should_write_exts {
-				return Ok(());
-			}
-
-			writer.next().write_tagged(Tag::context(3), |writer| {
-				writer.write_sequence(|writer| self.write_extensions(writer, &pub_key_spki, issuer))
-			})?;
-
-			Ok(())
-		})?;
-
-		Ok(der.into())
+		let tbs = self.tbs_certificate(pub_key, issuer)?;
+		let sig = issuer.key().sign(&tbs)?;
+		Ok(serialize_signed_der(&tbs, issuer.key().algorithm(), &sig).into())
 	}
 
 	fn write_extensions(
 		&self,
 		writer: &mut DERWriterSeq,
 		pub_key_spki: &[u8],
-		issuer: &Issuer<'_, impl SigningKey>,
+		issuer: &Issuer<'_, impl PublicKeyData>,
 	) -> Result<(), Error> {
 		if self.use_authority_key_identifier_extension {
 			AuthorityKeyIdentifier::from(issuer).write(writer.next());

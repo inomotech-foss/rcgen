@@ -79,7 +79,7 @@ pub use key_pair::serialize_private_key_pem;
 pub use key_pair::KeyPair;
 #[cfg(all(feature = "crypto", feature = "aws_lc_rs"))]
 pub use key_pair::RsaKeySize;
-pub use key_pair::{PublicKeyData, SigningKey, SubjectPublicKeyInfo};
+pub use key_pair::{serialize_signed_der, PublicKeyData, SigningKey, SubjectPublicKeyInfo};
 
 mod sign_algo;
 pub use sign_algo::algo::*;

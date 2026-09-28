@@ -589,20 +589,41 @@ pub(crate) fn sign_der(
 	key: &impl SigningKey,
 	f: impl FnOnce(&mut DERWriterSeq<'_>) -> Result<(), Error>,
 ) -> Result<Vec<u8>, Error> {
-	yasna::try_construct_der(|writer| {
+	let tbs = serialize_tbs(f)?;
+	let sig = key.sign(&tbs)?;
+	Ok(serialize_signed_der(&tbs, key.algorithm(), &sig))
+}
+
+/// Serializes `f` as a DER `SEQUENCE`, for use as a "to be signed" structure
+/// (e.g. a `TBSCertificate` or `TBSCertList`).
+pub(crate) fn serialize_tbs(
+	f: impl FnOnce(&mut DERWriterSeq<'_>) -> Result<(), Error>,
+) -> Result<Vec<u8>, Error> {
+	yasna::try_construct_der(|writer| writer.write_sequence(f))
+}
+
+/// Assembles a signed DER structure from its "to be signed" DER, the algorithm used to produce
+/// `signature`, and the raw `signature` bytes.
+///
+/// This produces the `SEQUENCE { tbs, signatureAlgorithm, signature }` wrapper that every signed
+/// X.509 structure rcgen emits shares, for example `Certificate` (RFC 5280 §4.1) and
+/// `CertificateList` (RFC 5280 §5.1). It is the counterpart to the `<Type>Params::tbs_*()`
+/// methods (e.g. [`CertificateParams::tbs_certificate`](crate::CertificateParams::tbs_certificate)):
+/// call one of those to obtain `tbs`, sign it with a key that may live outside of this process,
+/// then call this function to obtain the finished DER.
+#[must_use]
+pub fn serialize_signed_der(
+	tbs: &[u8],
+	algorithm: &'static SignatureAlgorithm,
+	signature: &[u8],
+) -> Vec<u8> {
+	yasna::construct_der(|writer| {
 		writer.write_sequence(|writer| {
-			let data = yasna::try_construct_der(|writer| writer.write_sequence(f))?;
-			writer.next().write_der(&data);
-
-			// Write signatureAlgorithm
-			key.algorithm().write_alg_ident(writer.next());
-
-			// Write signature
-			let sig = key.sign(&data)?;
-			let writer = writer.next();
-			writer.write_bitvec_bytes(&sig, sig.len() * 8);
-
-			Ok(())
+			writer.next().write_der(tbs);
+			algorithm.write_alg_ident(writer.next());
+			writer
+				.next()
+				.write_bitvec_bytes(signature, signature.len() * 8);
 		})
 	})
 }

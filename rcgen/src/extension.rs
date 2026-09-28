@@ -13,7 +13,7 @@ use crate::string::Ia5String;
 #[cfg(feature = "x509-parser")]
 use crate::Error;
 use crate::{
-	oid, write_distinguished_name, CertificateParams, DistinguishedName, Issuer, SigningKey,
+	oid, write_distinguished_name, CertificateParams, DistinguishedName, Issuer, PublicKeyData,
 };
 
 /// An X.509v3 subject alternative name extension according to [RFC 5280 §4.2.1.6].
@@ -884,7 +884,7 @@ impl StaticExtension for SubjectKeyIdentifier {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthorityKeyIdentifier(pub(crate) Vec<u8>);
 
-impl<S: SigningKey> From<&Issuer<'_, S>> for AuthorityKeyIdentifier {
+impl<S: PublicKeyData> From<&Issuer<'_, S>> for AuthorityKeyIdentifier {
 	fn from(issuer: &Issuer<'_, S>) -> Self {
 		Self(match issuer.key_identifier_method.as_ref() {
 			KeyIdMethod::PreSpecified(aki) => aki.clone(),
